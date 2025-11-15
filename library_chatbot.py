@@ -111,7 +111,7 @@ def get_vectorstore(_docs):
 @st.cache_resource
 def initialize_components(selected_model):
     # *** 현재는 PDF 경로가 고정되어 있음 ***
-    file_path = r"/mount/src/librarychatbot_gemini/드론의 해양과학조사 활용 국제동향.pdf"
+    file_path = r"/mount/src/librarychatbot_gemini/[챗봇프로그램및실습] 부경대학교 규정집.pdf"
 
     # pdf 로드
     pages = load_and_split_pdf(file_path)
@@ -168,7 +168,7 @@ def initialize_components(selected_model):
 # ---------------------------------------------------------
 # 6) Streamlit UI (챗봇 인터페이스)
 # ---------------------------------------------------------
-st.header("드론의 해양과학조사 활용 동향 Q&A 챗봇")
+st.header("국립부경대 도서관 규정 Q&A 챗봇")
 
 # 모델 선택
 option = st.selectbox(

@@ -2,6 +2,7 @@ import os
 import streamlit as st
 import nest_asyncio
 
+# Streamlit에서 async 관련 오류가 발생하지 않도록 이벤트 루프 패치
 nest_asyncio.apply()
 
 from langchain_community.document_loaders import PyPDFLoader
@@ -16,49 +17,76 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains.history_aware_retriever import create_history_aware_retriever
 from langchain_community.chat_message_histories.streamlit import StreamlitChatMessageHistory
 
-# sqlite 충돌 해결
-__import__("pysqlite3")
+# SQLite 관련 충돌 해결용 패치
+__import__('pysqlite3')
 import sys
-sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 
 from langchain_chroma import Chroma
 
 
-# Google API Key 읽기
+# ---------------------------------------------------------
+# 1) Gemini API 키 로드
+# ---------------------------------------------------------
 try:
     os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
-except:
-    st.error("Google API Key가 설정되어 있지 않습니다.")
+except Exception as e:
+    st.error("GOOGLE_API_KEY가 Streamlit Secrets에 설정되어 있지 않음")
     st.stop()
 
 
-# ----------------------------
-# PDF → Document 변환
-# ----------------------------
-def load_multiple_pdfs(uploaded_files):
+# ---------------------------------------------------------
+# 2) PDF 로드 & 텍스트 분할
+# ---------------------------------------------------------
+@st.cache_resource
+def load_and_split_pdf(file_path):
     """
-    여러 PDF 파일을 받아 pages(Document 리스트)로 합침.
+    하나의 PDF 파일을 로드하여 페이지 단위로 분할.
+    반환값: LangChain Document 객체 리스트
     """
-    all_docs = []
-    for file in uploaded_files:
-        temp_path = f"./temp_{file.name}"
-        with open(temp_path, "wb") as f:
-            f.write(file.read())
-        loader = PyPDFLoader(temp_path)
-        docs = loader.load_and_split()
-        all_docs.extend(docs)
-    return all_docs
+    loader = PyPDFLoader(file_path)
+    return loader.load_and_split()
 
 
-# ----------------------------
-# Chroma 벡터스토어 생성
-# ----------------------------
-def create_vector_store_from_docs(_docs):
+# ---------------------------------------------------------
+# 3) 벡터스토어 생성 (PDF → 텍스트 청크 → 임베딩 → Chroma 저장)
+# ---------------------------------------------------------
+@st.cache_resource
+def create_vector_store(_docs):
+    """
+    Document 리스트를 받아 텍스트 청크 분할 후 Chroma DB를 생성.
+    """
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200
     )
     split_docs = text_splitter.split_documents(_docs)
+    st.info(f"{len(split_docs)}개의 청크 생성됨")
+
+    persist_directory = "./chroma_db"
+
+    # HuggingFace 임베딩 로드
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={'device': 'cpu'},
+        encode_kwargs={'normalize_embeddings': True}
+    )
+
+    # Chroma DB 생성 및 저장
+    vectorstore = Chroma.from_documents(
+        split_docs,
+        embeddings,
+        persist_directory=persist_directory
+    )
+    return vectorstore
+
+
+# ---------------------------------------------------------
+# 4) 기존 Chroma DB가 있으면 로드, 없으면 새로 생성
+# ---------------------------------------------------------
+@st.cache_resource
+def get_vectorstore(_docs):
+    persist_directory = "./chroma_db"
 
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
@@ -66,140 +94,129 @@ def create_vector_store_from_docs(_docs):
         encode_kwargs={'normalize_embeddings': True}
     )
 
-    vectorstore = Chroma.from_documents(
-        documents=split_docs,
-        embedding=embeddings,
-        persist_directory="./chroma_db"
-    )
+    if os.path.exists(persist_directory):
+        # 기존 벡터 DB 사용
+        return Chroma(
+            persist_directory=persist_directory,
+            embedding_function=embeddings
+        )
+    else:
+        # 새로 생성
+        return create_vector_store(_docs)
 
-    return vectorstore
 
+# ---------------------------------------------------------
+# 5) RAG 구성 요소 초기화 (PDF → Vector → Retriever → LLM Chain)
+# ---------------------------------------------------------
+@st.cache_resource
+def initialize_components(selected_model):
+    # *** 현재는 PDF 경로가 고정되어 있음 ***
+    file_path = r"/mount/src/librarychatbot_gemini/[챗봇프로그램및실습] 부경대학교 규정집.pdf"
 
-# ----------------------------
-# RAG 구성 생성
-# ----------------------------
-def initialize_rag(selected_model, vectorstore):
+    # pdf 로드
+    pages = load_and_split_pdf(file_path)
+
+    # 벡터스토어 생성 또는 로드
+    vectorstore = get_vectorstore(pages)
+
+    # retriever 구성
     retriever = vectorstore.as_retriever()
 
+    # --- 대화 맥락 기반 질문 재구성 Prompt ---
+    contextualize_q_system_prompt = """Given a chat history ... """
     contextualize_q_prompt = ChatPromptTemplate.from_messages(
         [
-            ("system",
-             "Given chat history and a user question, rewrite it as a standalone question."),
+            ("system", contextualize_q_system_prompt),
             MessagesPlaceholder("history"),
             ("human", "{input}"),
         ]
     )
+
+    # --- 최종 답변 Prompt ---
+    qa_system_prompt = """You are an assistant ... {context}"""
 
     qa_prompt = ChatPromptTemplate.from_messages(
         [
-            ("system",
-             """You are a Korean question-answering assistant.
-                Use the following context to answer.
-                If you don't know the answer, say you don't know.
-                답변은 반드시 한국어 존댓말로 작성하세요.
-                {context}"""),
+            ("system", qa_system_prompt),
             MessagesPlaceholder("history"),
             ("human", "{input}"),
         ]
     )
 
+    # Gemini LLM 로드
     llm = ChatGoogleGenerativeAI(
         model=selected_model,
-        temperature=0.2,
+        temperature=0.7,
         convert_system_message_to_human=True
     )
 
+    # 대화 기반 Retriever
     history_aware_retriever = create_history_aware_retriever(
         llm, retriever, contextualize_q_prompt
     )
 
-    qa_chain = create_stuff_documents_chain(llm, qa_prompt)
+    # 문서 기반 QA 체인
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
 
-    rag_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
+    # RAG 구성 (Retriever → LLM)
+    rag_chain = create_retrieval_chain(
+        history_aware_retriever, question_answer_chain
+    )
     return rag_chain
 
 
-# ----------------------------
-# Streamlit UI
-# ----------------------------
+# ---------------------------------------------------------
+# 6) Streamlit UI (챗봇 인터페이스)
+# ---------------------------------------------------------
+st.header("국립부경대 도서관 규정 Q&A 챗봇")
 
-st.set_page_config(page_title="PDF 기반 RAG 챗봇", layout="wide")
-
-st.markdown(
-    """
-    <style>
-    .main-title {
-        background-color: #1E88E5;
-        padding: 20px;
-        border-radius: 10px;
-        color: white;
-        font-size: 26px;
-        font-weight: 600;
-        text-align: center;
-        margin-bottom: 20px;
-    }
-    .chat-container {
-        background-color: #F5F5F5;
-        border-radius: 10px;
-        padding: 15px;
-        margin-top: 10px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
+# 모델 선택
+option = st.selectbox(
+    "Select Gemini Model",
+    ("gemini-2.0-flash-exp", "gemini-2.5-flash", "gemini-2.0-flash-lite")
 )
 
-st.markdown('<div class="main-title">PDF 기반 RAG 챗봇</div>', unsafe_allow_html=True)
+# RAG 초기화
+with st.spinner("초기화 중..."):
+    try:
+        rag_chain = initialize_components(option)
+        st.success("초기화 완료")
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
-st.info("PDF 여러 개를 업로드하면 해당 문서 전체를 기반으로 답변합니다.")
+# 채팅 히스토리 저장
+chat_history = StreamlitChatMessageHistory(key="chat_messages")
 
-
-# PDF 업로드
-uploaded_files = st.file_uploader(
-    "PDF 파일 업로드 (여러 개 가능)",
-    type=["pdf"],
-    accept_multiple_files=True
+conversational_rag_chain = RunnableWithMessageHistory(
+    rag_chain,
+    lambda session_id: chat_history,
+    input_messages_key="input",
+    history_messages_key="history",
+    output_messages_key="answer",
 )
 
-model_name = st.selectbox(
-    "Gemini Model 선택",
-    ["gemini-2.0-flash-exp", "gemini-2.5-flash", "gemini-2.0-flash-lite"]
-)
+# 기존 메시지 출력
+for msg in chat_history.messages:
+    st.chat_message(msg.type).write(msg.content)
 
-if uploaded_files:
-    with st.spinner("PDF 처리 중…"):
-        pages = load_multiple_pdfs(uploaded_files)  # 여러 PDF 로드
-        vectorstore = create_vector_store_from_docs(pages)
+# 사용자 입력 처리
+if prompt_message := st.chat_input("Your question"):
+    st.chat_message("human").write(prompt_message)
 
-    with st.spinner("RAG 구성 중…"):
-        rag_chain = initialize_rag(model_name, vectorstore)
+    with st.chat_message("ai"):
+        with st.spinner("Thinking..."):
+            config = {"configurable": {"session_id": "any"}}
 
-    st.success("챗봇 준비 완료")
+            response = conversational_rag_chain.invoke(
+                {"input": prompt_message},
+                config
+            )
+            answer = response['answer']
+            st.write(answer)
 
-    chat_history = StreamlitChatMessageHistory(key="chat_messages")
+            # 참고 문서 표시
+            with st.expander("참고 문서"):
+                for doc in response['context']:
+                    st.markdown(doc.metadata['source'], help=doc.page_content)
 
-    conversational_rag = RunnableWithMessageHistory(
-        rag_chain,
-        lambda session_id: chat_history,
-        input_messages_key="input",
-        history_messages_key="history",
-        output_messages_key="answer"
-    )
-
-    for msg in chat_history.messages:
-        st.chat_message(msg.type).write(msg.content)
-
-    if user_input := st.chat_input("질문을 입력하세요"):
-        st.chat_message("human").write(user_input)
-
-        with st.chat_message("ai"):
-            with st.spinner("답변 생성 중…"):
-                response = conversational_rag.invoke(
-                    {"input": user_input},
-                    {"configurable": {"session_id": "default"}}
-                )
-                answer = response["answer"]
-                st.write(answer)
-
-else:
-    st.warning("PDF 파일을 업로드하세요.")
